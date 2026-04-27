@@ -333,8 +333,10 @@ def render_sidebar_config():
 
             st.markdown("**Stopword Settings**")
             st.caption(
-                "停用词是在分词统计和主题建模中被过滤的常见词，例如“的、了、这个”。"
-                "自定义后会影响Sentiment Analysis图表的高频词 Top10 和Topic Analysis结果；结合当前Video补充无意义口头词、梗词或平台词，效果通常更好。"
+                "Stopwords are common low-value terms filtered during tokenization, word-frequency statistics, "
+                "and topic modeling. Customizing them affects Top 10 keywords in sentiment charts and topic "
+                "analysis results. Adding filler words, meme terms, or platform-specific noise for the current "
+                "video usually improves the output."
             )
             stopwords_val = st.text_area(
                 "Global Stopwords",
