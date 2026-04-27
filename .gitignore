@@ -26,3 +26,13 @@ Thumbs.db
 
 # Streamlit 缓存
 .streamlit/secrets.toml
+
+# Local assistant config
+.claude/
+
+# Generated or downloaded media
+data/audio/
+*.m4a
+*.mp3
+*.wav
+*.webm
