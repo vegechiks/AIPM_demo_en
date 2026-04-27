@@ -1,0 +1,336 @@
+"""
+Sentiment visualization helpers: region normalization, word frequency,
+map data and AI report generation.
+"""
+from __future__ import annotations
+
+import json
+import re
+from collections import Counter
+from hashlib import md5
+
+import jieba
+import pandas as pd
+from openai import OpenAI
+from pyecharts import options as opts
+from pyecharts.charts import Map
+from pyecharts.commons.utils import JsCode
+
+from backend.config import DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+from backend.stopwords import merge_stopwords
+
+CHINA_PROVINCES = {
+    "北京", "天津", "上海", "重庆",
+    "河北", "山西", "辽宁", "吉林", "黑龙江",
+    "江苏", "浙江", "安徽", "福建", "江西", "山东",
+    "河南", "湖北", "湖南", "广东", "海南",
+    "四川", "贵州", "云南", "陕西", "甘肃", "青海",
+    "内蒙古", "广西", "西藏", "宁夏", "新疆",
+    "香港", "澳门", "台湾",
+}
+
+PYECHARTS_MAP_NAMES = {
+    "北京": "北京市",
+    "天津": "天津市",
+    "上海": "上海市",
+    "重庆": "重庆市",
+    "河北": "河北省",
+    "山西": "山西省",
+    "辽宁": "辽宁省",
+    "吉林": "吉林省",
+    "黑龙江": "黑龙江省",
+    "江苏": "江苏省",
+    "浙江": "浙江省",
+    "安徽": "安徽省",
+    "福建": "福建省",
+    "江西": "江西省",
+    "山东": "山东省",
+    "河南": "河南省",
+    "湖北": "湖北省",
+    "湖南": "湖南省",
+    "广东": "广东省",
+    "海南": "海南省",
+    "四川": "四川省",
+    "贵州": "贵州省",
+    "云南": "云南省",
+    "陕西": "陕西省",
+    "甘肃": "甘肃省",
+    "青海": "青海省",
+    "内蒙古": "内蒙古自治区",
+    "广西": "广西壮族自治区",
+    "西藏": "西藏自治区",
+    "宁夏": "宁夏回族自治区",
+    "新疆": "新疆维吾尔自治区",
+    "香港": "香港特别行政区",
+    "澳门": "澳门特别行政区",
+    "台湾": "台湾省",
+}
+
+PROVINCE_ALIASES = {
+    "北京市": "北京", "天津市": "天津", "上海市": "上海", "重庆市": "重庆",
+    "河北省": "河北", "山西省": "山西", "辽宁省": "辽宁", "吉林省": "吉林", "黑龙江省": "黑龙江",
+    "江苏省": "江苏", "浙江省": "浙江", "安徽省": "安徽", "福建省": "福建", "江西省": "江西", "山东省": "山东",
+    "河南省": "河南", "湖北省": "湖北", "湖南省": "湖南", "广东省": "广东", "海南省": "海南",
+    "四川省": "四川", "贵州省": "贵州", "云南省": "云南", "陕西省": "陕西", "甘肃省": "甘肃", "青海省": "青海",
+    "内蒙古自治区": "内蒙古", "广西壮族自治区": "广西", "西藏自治区": "西藏",
+    "宁夏回族自治区": "宁夏", "新疆维吾尔自治区": "新疆",
+    "香港特别行政区": "香港", "澳门特别行政区": "澳门",
+    "台湾省": "台湾",
+}
+
+def normalize_china_province(value: str) -> str | None:
+    text = str(value or "").strip()
+    if not text or text == "Unknown":
+        return None
+    text = text.replace("IP属地：", "").replace("IP属地:", "").strip()
+    if text in PROVINCE_ALIASES:
+        return PROVINCE_ALIASES[text]
+    if text in CHINA_PROVINCES:
+        return text
+    for province in sorted(CHINA_PROVINCES, key=len, reverse=True):
+        if text.startswith(province):
+            return province
+    return None
+
+
+def with_china_province(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "ip_province" not in out.columns:
+        out["china_province"] = None
+        return out
+    out["china_province"] = out["ip_province"].apply(normalize_china_province)
+    return out
+
+
+def top_words_from_texts(texts, topn: int = 10, stopwords: set[str] | None = None) -> list[tuple[str, int]]:
+    counter: Counter[str] = Counter()
+    stopword_set = stopwords if stopwords is not None else merge_stopwords()
+    for text in texts:
+        for word in jieba.lcut(str(text or "")):
+            word = word.strip().lower()
+            if (
+                len(word) < 2
+                or word in stopword_set
+                or re.fullmatch(r"[\W_]+", word)
+                or re.fullmatch(r"\d+(\.\d+)?", word)
+            ):
+                continue
+            counter[word] += 1
+    return counter.most_common(topn)
+
+
+def format_top_words(words: list[tuple[str, int]]) -> str:
+    if not words:
+        return "None"
+    return "<br>".join(f"{word}: {count}" for word, count in words)
+
+
+def top_words_html(df: pd.DataFrame, topn: int = 10, stopwords: set[str] | None = None) -> str:
+    if df.empty or "content" not in df.columns:
+        return "None"
+    return format_top_words(top_words_from_texts(df["content"].astype(str).tolist(), topn=topn, stopwords=stopwords))
+
+
+def sentiment_counts(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    if group_col not in df.columns or "sentiment" not in df.columns:
+        return pd.DataFrame()
+    counts = (
+        df.groupby([group_col, "sentiment"])
+        .size()
+        .reset_index(name="count")
+    )
+    return counts
+
+
+def build_china_map_rows(df: pd.DataFrame, stopwords: set[str] | None = None) -> list[dict]:
+    if "sentiment" not in df.columns:
+        return []
+    china_df = with_china_province(df)
+    china_df = china_df[china_df["china_province"].notna()].copy()
+    sentiment_text = china_df["sentiment"].astype(str).str.lower()
+    china_df["_sentiment_norm"] = sentiment_text.map(
+        {
+            "positive": "positive",
+            "Positive": "positive",
+            "neutral": "neutral",
+            "Neutral": "neutral",
+            "negative": "negative",
+            "Negative": "negative",
+        }
+    ).fillna(sentiment_text)
+    rows: list[dict] = []
+    for province, group in china_df.groupby("china_province"):
+        positive = int((group["_sentiment_norm"] == "positive").sum())
+        negative = int((group["_sentiment_norm"] == "negative").sum())
+        neutral = int((group["_sentiment_norm"] == "neutral").sum())
+        denom = positive + negative
+        if denom <= 0:
+            continue
+        ratio = positive / denom
+        rows.append(
+            {
+                "province": province,
+                "map_name": province,
+                "positive": positive,
+                "negative": negative,
+                "neutral": neutral,
+                "total": int(len(group)),
+                "ratio": ratio,
+                "top_words": top_words_html(group, stopwords=stopwords),
+            }
+        )
+    rows.sort(key=lambda item: item["ratio"], reverse=True)
+    return rows
+
+
+def render_china_sentiment_map(rows: list[dict]) -> str:
+    # 方案C: 短名 data + nameMap{长名 -> 短名}，与独立地图测试通过的逻辑一致。
+    data_pair = [
+        (
+            row.get("map_name") or row["province"],
+            [
+                round(row["ratio"], 4),
+                row["positive"],
+                row["negative"],
+                row["neutral"],
+                row["total"],
+                row["top_words"],
+            ],
+        )
+        for row in rows
+    ]
+
+    # 数据自适应范围：确保即使负面评论占主导时颜色也清晰可见
+    ratios = [row["ratio"] for row in rows]
+    vmin = round(min(ratios), 4) if ratios else 0.0
+    vmax = round(max(ratios), 4) if ratios else 1.0
+    if vmax <= vmin:
+        vmax = min(vmin + 0.05, 1.0)
+
+    tooltip_formatter = JsCode(
+        """
+            function(params){
+                if(!params.data || !Array.isArray(params.data.value)) {
+                    return params.name + '<br/>No positive/negative comment data';
+                }
+                var v = params.data.value;
+                return params.name
+                    + '<br/>Positive tendency: ' + (v[0] * 100).toFixed(1) + '%'
+                    + '<br/>Positive: ' + v[1] + ' Negative: ' + v[2] + ' Neutral: ' + v[3]
+                    + '<br/>Total comments: ' + v[4]
+                    + '<br/><br/>Top 10 Keywords:<br/>' + v[5];
+            }
+        """
+    )
+
+    chart = (
+        Map(init_opts=opts.InitOpts(width="100%", height="620px"))
+        .add(
+            "Positive Tendency",
+            data_pair,
+            "china",
+            is_map_symbol_show=False,
+            label_opts=opts.LabelOpts(is_show=False),
+            name_map=PROVINCE_ALIASES,
+        )
+        .set_global_opts(
+            title_opts=opts.TitleOpts(
+                title="Positive Sentiment Heatmap by China Region",
+                subtitle="Score = positive comments / (positive + negative comments). Hong Kong, Macau, and Taiwan are kept; overseas and unknown IPs are excluded.",
+            ),
+            visualmap_opts=opts.VisualMapOpts(
+                min_=vmin,
+                max_=vmax,
+                dimension=0,
+                range_text=["Higher positive share", "Lower positive share"],
+                is_calculable=True,
+                range_color=["#fff7bc", "#fec44f", "#f03b20", "#bd0026"],
+            ),
+            tooltip_opts=opts.TooltipOpts(formatter=tooltip_formatter),
+        )
+    )
+    return chart.render_embed()
+
+
+def build_ai_report_payload(df: pd.DataFrame, stopwords: set[str] | None = None) -> dict:
+    label_map = {"positive": "Positive", "neutral": "Neutral", "negative": "Negative"}
+    payload: dict = {
+        "overall": {},
+        "gender": [],
+        "regions": [],
+    }
+
+    overall_counts = df["sentiment"].value_counts().to_dict() if "sentiment" in df.columns else {}
+    payload["overall"] = {
+        label_map.get(k, k): int(v)
+        for k, v in overall_counts.items()
+    }
+    payload["overall_top_words"] = top_words_from_texts(
+        df.get("content", pd.Series(dtype=str)).astype(str).tolist(),
+        topn=10,
+        stopwords=stopwords,
+    )
+
+    if "gender" in df.columns:
+        gender_map = {"男": "Male", "女": "Female", "保密": "Unknown"}
+        tmp = df.copy()
+        tmp["gender_group"] = tmp["gender"].map(gender_map).fillna("Unknown")
+        for gender, group in tmp.groupby("gender_group"):
+            counts = group["sentiment"].value_counts().to_dict()
+            payload["gender"].append(
+                {
+                    "Gender": gender,
+                    "Sample Size": int(len(group)),
+                    "Positive": int(counts.get("positive", 0)),
+                    "Neutral": int(counts.get("neutral", 0)),
+                    "Negative": int(counts.get("negative", 0)),
+                    "Top Keywords": top_words_from_texts(group["content"].astype(str).tolist(), topn=10, stopwords=stopwords),
+                }
+            )
+
+    for row in build_china_map_rows(df, stopwords=stopwords):
+        payload["regions"].append(
+            {
+                "Province": row["province"],
+                "Sample Size": row["total"],
+                "Positive": row["positive"],
+                "Neutral": row["neutral"],
+                "Negative": row["negative"],
+                "Positive Tendency": round(row["ratio"], 4),
+                "Top Keywords": row["top_words"].replace("<br>", "；"),
+            }
+        )
+    payload["regions"] = payload["regions"][:20]
+    return payload
+
+
+def report_cache_key(df: pd.DataFrame, stopwords_text: str = "") -> str:
+    cols = [col for col in ["comment_id", "content", "sentiment", "gender", "ip_province"] if col in df.columns]
+    raw = df[cols].to_json(force_ascii=False, orient="records") + "\n" + str(stopwords_text or "")
+    return md5(raw.encode("utf-8")).hexdigest()
+
+
+def generate_ai_sentiment_report(df: pd.DataFrame, api_key: str, stopwords: set[str] | None = None) -> str:
+    payload = build_ai_report_payload(df, stopwords=stopwords)
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    prompt = f"""Generate an English analysis report based on the following short-video comment sentiment statistics.
+
+Requirements:
+1. Structure the report with: overall sentiment overview, gender differences, regional differences, major focus points, and analysis caveats.
+2. Do not overinterpret small samples; groups with fewer than 3 samples are reference-only.
+3. Regional positive tendency is defined as positive comments / (positive + negative comments); neutral comments are excluded from the denominator.
+4. Use concise, objective English suitable for a data analysis report.
+
+Statistics JSON:
+{json.dumps(payload, ensure_ascii=False)}
+"""
+    resp = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[
+            {"role": "system", "content": "You are a rigorous short-video public opinion data analyst skilled at explaining sentiment distributions, group differences, and regional differences."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=1400,
+    )
+    return (resp.choices[0].message.content or "").strip()
